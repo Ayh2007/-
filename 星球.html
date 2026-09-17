@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>粒子星球手势控制器</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        /* 用于MediaPipe输入的视频，隐藏 */
+        #input-video {
+            display: none;
+        }
+
+        /* UI 提示层 */
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            color: rgba(255, 255, 255, 0.8);
+            pointer-events: none;
+            user-select: none;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px rgba(255, 166, 0, 0.8);
+        }
+
+        .instruction {
+            margin-top: 10px;
+            font-size: 0.9rem;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            border-left: 3px solid #ffaa00;
+        }
+
+        .status {
+            margin-top: 5px;
+            font-weight: bold;
+            color: #00ffcc;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            z-index: 20;
+            text-align: center;
+        }
+        
+        /* 摄像头预览小窗 */
+        #webcam-preview {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 160px;
+            height: 120px;
+            z-index: 10;
+            border: 2px solid #333;
+            border-radius: 8px;
+            opacity: 0.7;
+            transform: scaleX(-1); /* 镜像翻转 */
+        }
+    </style>
+
+    <!-- 1. MediaPipe 依赖 (常规 Script 方式) -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <!-- 2. Three.js Import Map for Modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="loading">正在启动神经连接...<br><span style="font-size:14px; opacity:0.7">请允许摄像头权限</span></div>
+
+    <div id="ui-layer">
+        <h1>粒子星云核心</h1>
+        <div class="instruction">
+            👋 <b>旋转手掌</b>: 旋转相机视角<br>
+            ✊ <b>握拳并拉远</b>: 相机远离 (加速)<br>
+            ✋ <b>五指张开靠近</b>: 相机靠近 (减速)<br>
+        </div>
+        <div id="gesture-status" class="status">等待手势...</div>
+    </div>
+
+    <!-- 隐藏的原始视频输入 -->
+    <video id="input-video"></video>
+    <!-- 用于反馈的小画布 -->
+    <canvas id="webcam-preview"></canvas>
+    <!-- 主3D场景 -->
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // ==========================================
+        // 1. 全局变量与配置
+        // ==========================================
+        const CONFIG = {
+            planetColor: 0xff6600, // 绚烂橙色
+            ringColor: 0xffffff,   // 白色
+            particleCount: 8000,
+            ringParticleCount: 4000,
+            minDistance: 120,      // 最近距离
+            maxDistance: 800,      // 最远限制(可选)
+            defaultDistance: 300,
+            rotationSpeedMultiplier: 0.05
+        };
+
+        let scene, camera, renderer, composer;
+        let planetSystem, ringSystem1, ringSystem2;
+        let time = 0;
+
+        // 相机控制状态
+        const cameraState = {
+            radius: CONFIG.defaultDistance,
+            theta: Math.PI / 2, // 垂直角度
+            phi: 0,             // 水平角度
+            zoomVelocity: 0,    // 缩放速度
+            targetRadius: CONFIG.defaultDistance,
+            isFist: false,
+            isOpen: false,
+            handRotation: 0     // 手掌旋转量
+        };
+
+        const statusEl = document.getElementById('gesture-status');
+        const loadingEl = document.getElementById('loading');
+
+        // ==========================================
+        // 2. Three.js 初始化与场景构建
+        // ==========================================
+        
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+
+            // 场景
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.0005);
+
+            // 相机
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 2000);
+            camera.position.set(0, 0, CONFIG.defaultDistance);
+
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            // 后期处理 (Bloom 发光)
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0;
+            bloomPass.strength = 2.0; // 强度高，显得很亮
+            bloomPass.radius = 0.5;
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            // 创建材质纹理 (光点)
+            const particleTexture = createParticleTexture();
+
+            // --- 创建星球 ---
+            const planetGeo = new THREE.BufferGeometry();
+            const planetPos = [];
+            const planetSizes = [];
+
+            // 生成球体表面的密集粒子
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                // 极坐标随机分布，但在半径上聚集
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                
+                // 半径分布：主要在表面(R=50)，少量在内部填充
+                let r = 50; 
+                if (Math.random() > 0.8) r = 50 * Math.random(); // 20% 内部填充
+
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                planetPos.push(x, y, z);
+                planetSizes.push(Math.random() * 2 + 1); // 大小随机
+            }
+
+            planetGeo.setAttribute('position', new THREE.Float32BufferAttribute(planetPos, 3));
+            planetGeo.setAttribute('size', new THREE.Float32BufferAttribute(planetSizes, 1));
+
+            const planetMat = new THREE.PointsMaterial({
+                color: CONFIG.planetColor,
+                size: 3,
+                map: particleTexture,
+                transparent: true,
+                opacity: 0.9,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            planetSystem = new THREE.Points(planetGeo, planetMat);
+            scene.add(planetSystem);
+
+            // --- 创建星环 ---
+            const createRing = (radiusInner, radiusOuter, count, tiltX, tiltZ) => {
+                const geo = new THREE.BufferGeometry();
+                const pos = [];
+                for(let i=0; i<count; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    // 环的半径分布
+                    const r = THREE.MathUtils.lerp(radiusInner, radiusOuter, Math.random());
+                    const x = r * Math.cos(angle);
+                    const y = (Math.random() - 0.5) * 2; // 环的厚度极薄
+                    const z = r * Math.sin(angle);
+                    pos.push(x, y, z);
+                }
+                geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                const mat = new THREE.PointsMaterial({
+                    color: CONFIG.ringColor,
+                    size: 2,
+                    map: particleTexture,
+                    transparent: true,
+                    opacity: 0.6,
+                    blending: THREE.AdditiveBlending,
+                    depthWrite: false
+                });
+                const sys = new THREE.Points(geo, mat);
+                sys.rotation.x = tiltX;
+                sys.rotation.z = tiltZ;
+                return sys;
+            };
+
+            ringSystem1 = createRing(70, 110, CONFIG.ringParticleCount, Math.PI / 3, Math.PI / 6);
+            ringSystem2 = createRing(80, 140, CONFIG.ringParticleCount, -Math.PI / 4, -Math.PI / 8);
+            
+            scene.add(ringSystem1);
+            scene.add(ringSystem2);
+
+            // 监听窗口调整
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // 辅助函数：生成圆形渐变Canvas纹理
+        function createParticleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32;
+            canvas.height = 32;
+            const context = canvas.getContext('2d');
+            const gradient = context.createRadialGradient(16, 16, 0, 16, 16, 16);
+            gradient.addColorStop(0, 'rgba(255,255,255,1)');
+            gradient.addColorStop(0.2, 'rgba(255,255,255,0.8)');
+            gradient.addColorStop(0.5, 'rgba(255,255,255,0.2)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            context.fillStyle = gradient;
+            context.fillRect(0, 0, 32, 32);
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // ==========================================
+        // 3. 动画与逻辑更新
+        // ==========================================
+
+        function updateCamera() {
+            // 1. 处理旋转 (根据手势)
+            // 手掌旋转值 (cameraState.handRotation) 是一个偏移量
+            // 如果手旋转了，我们让相机围绕中心旋转（改变 phi）
+            // 设置一个死区，防止抖动
+            if (Math.abs(cameraState.handRotation) > 0.1) {
+                cameraState.phi += cameraState.handRotation * CONFIG.rotationSpeedMultiplier;
+            }
+
+            // 2. 处理缩放 (握拳 vs 张开)
+            if (cameraState.isFist) {
+                // 握拳: 远离。速度先慢后快。
+                // 增加向外的速度
+                cameraState.zoomVelocity += 0.5; 
+            } else if (cameraState.isOpen) {
+                // 张开: 靠近。速度先快后慢。
+                // 我们通过设置目标点来实现"先快后慢"的 lerp 效果
+                // 为了模拟"靠近"，我们将目标设为 minDistance
+                cameraState.targetRadius = CONFIG.minDistance;
+                
+                // 使用 Lerp 逼近，越近越慢
+                const diff = cameraState.radius - CONFIG.minDistance;
+                cameraState.zoomVelocity = -diff * 0.05; // 距离越远速度越快，越近越慢
+            } else {
+                // 无手势，阻尼停止
+                cameraState.zoomVelocity *= 0.9;
+            }
+
+            // 应用速度
+            cameraState.radius += cameraState.zoomVelocity;
+
+            // 限制范围
+            if (cameraState.radius < CONFIG.minDistance) {
+                cameraState.radius = CONFIG.minDistance;
+                cameraState.zoomVelocity = 0;
+            }
+            if (cameraState.radius > 2000) {
+                 cameraState.radius = 2000; // 防止无限远
+            }
+
+            // 3. 将球坐标转换为笛卡尔坐标
+            // x = r * sin(theta) * sin(phi)
+            // y = r * cos(theta)
+            // z = r * sin(theta) * cos(phi)
+            // 注意：为了让星球像在旋转，我们改变 phi (水平环绕)
+            
+            // 添加一点自然的星球自转感(如果没动手)
+            if (!cameraState.isFist && !cameraState.isOpen && Math.abs(cameraState.handRotation) < 0.1) {
+               cameraState.phi -= 0.001;
+            }
+
+            camera.position.x = cameraState.radius * Math.sin(cameraState.theta) * Math.sin(cameraState.phi);
+            camera.position.y = cameraState.radius * Math.cos(cameraState.theta); // 这里 theta 固定为 90度附近，保持水平视角
+            camera.position.z = cameraState.radius * Math.sin(cameraState.theta) * Math.cos(cameraState.phi);
+
+            camera.lookAt(0, 0, 0);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            time += 0.005;
+
+            // 粒子本身的一些细微蠕动
+            if (planetSystem) {
+                planetSystem.rotation.y = time * 0.1;
+            }
+            if (ringSystem1) ringSystem1.rotation.z -= 0.002;
+            if (ringSystem2) ringSystem2.rotation.z += 0.003;
+
+            updateCamera();
+
+            composer.render();
+        }
+
+        // ==========================================
+        // 4. MediaPipe Hands 集成
+        // ==========================================
+        
+        // 预览 Canvas
+        const previewCanvas = document.getElementById('webcam-preview');
+        const previewCtx = previewCanvas.getContext('2d');
+        
+        function onResults(results) {
+            // 绘制预览图（方便用户调试位置）
+            previewCtx.save();
+            previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+            previewCtx.drawImage(results.image, 0, 0, previewCanvas.width, previewCanvas.height);
+            
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 绘制骨架到小窗
+                drawConnectors(previewCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                drawLandmarks(previewCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+
+                // --- 逻辑判断 ---
+                
+                // 1. 判断旋转 (计算手掌倾斜度)
+                // 使用手腕(0)和中指指根(9)的X坐标差值来判断旋转
+                // 正常竖直时，x接近。向左歪或向右歪会产生 deltaX
+                const wrist = landmarks[0];
+                const middleBase = landmarks[9];
+                
+                // 计算 Roll 角 (围绕 Z 轴的旋转)
+                // Math.atan2(y, x). 这里我们看 dx 和 dy
+                // 注意：Webcam 坐标系 y 向下为正
+                const dx = middleBase.x - wrist.x;
+                const dy = middleBase.y - wrist.y; 
+                // 理想竖直状态 dy 很大(负值)，dx 很小
+                // 简单起见，我们直接映射 dx。
+                // 如果手向右歪(顺时针)，dx > 0。向左歪，dx < 0。
+                // 乘以一个灵敏度系数
+                cameraState.handRotation = dx * -5.0; // 反向使得符合直觉
+
+
+                // 2. 判断 握拳 vs 张开
+                // 算法：计算指尖(Tip)到手腕(Wrist)的距离，对比指根(MCP)到手腕的距离
+                // 如果 Tip 距离 < MCP 距离，说明折叠了。
+                
+                const fingerTips = [8, 12, 16, 20]; // 食指到小指尖
+                const fingerMCPs = [5, 9, 13, 17];  // 食指到小指根
+                
+                let foldedCount = 0;
+                
+                // 简单距离平方比较
+                const distSq = (p1, p2) => (p1.x - p2.x)**2 + (p1.y - p2.y)**2;
+
+                for (let i = 0; i < 4; i++) {
+                    const dTip = distSq(landmarks[fingerTips[i]], wrist);
+                    const dMcp = distSq(landmarks[fingerMCPs[i]], wrist);
+                    // 如果指尖比指根离手腕更近，或者非常接近，判定为弯曲
+                    // 加上一个阈值系数
+                    if (dTip < dMcp * 1.2) {
+                        foldedCount++;
+                    }
+                }
+
+                // 状态机
+                if (foldedCount >= 3) {
+                    cameraState.isFist = true;
+                    cameraState.isOpen = false;
+                    statusEl.innerText = "状态: ✊ 握拳 (拉远)";
+                    statusEl.style.color = "#ff4444";
+                } else if (foldedCount === 0) {
+                    cameraState.isFist = false;
+                    cameraState.isOpen = true;
+                    statusEl.innerText = "状态: ✋ 张开 (靠近)";
+                    statusEl.style.color = "#44ff44";
+                } else {
+                    cameraState.isFist = false;
+                    cameraState.isOpen = false;
+                    statusEl.innerText = "状态: 🤞 旋转控制中";
+                    statusEl.style.color = "#00ffcc";
+                }
+
+            } else {
+                // 没有检测到手
+                cameraState.handRotation = 0;
+                cameraState.isFist = false;
+                cameraState.isOpen = false;
+                statusEl.innerText = "未检测到手";
+                statusEl.style.color = "#888";
+            }
+            previewCtx.restore();
+        }
+
+        function initMediaPipe() {
+            const videoElement = document.getElementById('input-video');
+
+            // 这里的 Hands 来自全局变量 (Script Tag引入)
+            const hands = new window.Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onResults);
+
+            // 使用 Camera Utils 启动摄像头
+            const cameraUtils = new window.Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480
+            });
+            
+            cameraUtils.start()
+                .then(() => {
+                    loadingEl.style.display = 'none';
+                })
+                .catch(err => {
+                    loadingEl.innerHTML = "摄像头启动失败: " + err;
+                });
+            
+            // 设置预览画布大小
+            previewCanvas.width = 160;
+            previewCanvas.height = 120;
+        }
+
+        // ==========================================
+        // 启动
+        // ==========================================
+        initThree();
+        animate();
+        // 延迟一点加载AI，让UI先出来
+        setTimeout(initMediaPipe, 1000);
+
+    </script>
+</body>
+</html>
